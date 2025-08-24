@@ -895,11 +895,15 @@ def main():
         </div>
         """, unsafe_allow_html=True)
 
-        if __name__ == "__main__":
-            main()
-                        f"{total_shipments:,}",
-                        help="Total billed shipments in period"
-                    )
+
+if __name__ == "__main__":
+    main()
+
+    st.metric(
+        label="Total Shipments",
+        value=f"{total_shipments:,}",
+        help="Total billed shipments in period"
+    )
         
         with col2:
             st.metric(
