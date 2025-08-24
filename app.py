@@ -897,7 +897,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-                "Total Shipments",
                 f"{total_shipments:,}",
                 help="Total billed shipments in period"
             )
