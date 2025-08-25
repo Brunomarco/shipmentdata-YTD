@@ -7,6 +7,38 @@ import numpy as np
 from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
+import io, hashlib
+
+def _file_hash(uploaded_file) -> str:
+    return hashlib.md5(uploaded_file.getvalue()).hexdigest()
+
+@st.cache_data(show_spinner=True)
+def load_data_from_bytes(file_bytes: bytes):
+    df = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
+    # drop duplicate column names
+    df = df.loc[:, ~df.columns.duplicated()]
+    # --- your existing cleaning below ---
+    # filter 440-BILLED
+    df = df[df['STATUS'] == '440-BILLED'].copy()
+    # convert dates (only if present)
+    for col in ['ORD CREATE','READY','QT PU','ACT PU','QDT','UPD DEL','POD DATE/TIME',
+                'Depart Date / Time','Arrive Date / Time','PICKUP DATE/TIME','Depart Date']:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+    # currency
+    df['TOTAL_CHARGES_EUR'] = pd.to_numeric(df['TOTAL CHARGES'], errors='coerce') * 0.92
+    # route (if exists)
+    if {'DEP','ARR'}.issubset(df.columns):
+        df['Route'] = df['DEP'].astype(str) + ' → ' + df['ARR'].astype(str)
+    return df
+
+uploaded = st.file_uploader("Upload Excel File", type=['xlsx','xls'], label_visibility="collapsed")
+if not uploaded:
+    st.stop()
+
+file_bytes = uploaded.getvalue()
+df = load_data_from_bytes(file_bytes)  # <- now cached by content
+
 
 # Page configuration
 st.set_page_config(
