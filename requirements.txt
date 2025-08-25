@@ -1,11 +1,9 @@
-# Core dependencies
-streamlit>=1.33.0
-pandas>=2.0.0
-plotly>=5.22.0
-openpyxl>=3.1.2
-numpy>=1.26.0
-
-# Additional dependencies for better performance
-xlrd>=2.0.1  # For reading older Excel files (.xls)
-python-dateutil>=2.8.2  # For better date handling
-pytz>=2024.1  # For timezone support
+streamlit==1.29.0
+pandas==2.1.4
+plotly==5.18.0
+openpyxl==3.1.2
+numpy==1.26.2
+xlrd==2.0.1
+python-dateutil==2.8.2
+statsmodels==0.14.1
+scipy==1.11.4
