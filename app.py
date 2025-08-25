@@ -7,40 +7,9 @@ import numpy as np
 from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
-import io, hashlib
+import io
 
-def _file_hash(uploaded_file) -> str:
-    return hashlib.md5(uploaded_file.getvalue()).hexdigest()
-
-@st.cache_data(show_spinner=True)
-def load_data_from_bytes(file_bytes: bytes):
-    df = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
-    # drop duplicate column names
-    df = df.loc[:, ~df.columns.duplicated()]
-    # --- your existing cleaning below ---
-    # filter 440-BILLED
-    df = df[df['STATUS'] == '440-BILLED'].copy()
-    # convert dates (only if present)
-    for col in ['ORD CREATE','READY','QT PU','ACT PU','QDT','UPD DEL','POD DATE/TIME',
-                'Depart Date / Time','Arrive Date / Time','PICKUP DATE/TIME','Depart Date']:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors='coerce')
-    # currency
-    df['TOTAL_CHARGES_EUR'] = pd.to_numeric(df['TOTAL CHARGES'], errors='coerce') * 0.92
-    # route (if exists)
-    if {'DEP','ARR'}.issubset(df.columns):
-        df['Route'] = df['DEP'].astype(str) + ' → ' + df['ARR'].astype(str)
-    return df
-
-uploaded = st.file_uploader("Upload Excel File", type=['xlsx','xls'], label_visibility="collapsed")
-if not uploaded:
-    st.stop()
-
-file_bytes = uploaded.getvalue()
-df = load_data_from_bytes(file_bytes)  # <- now cached by content
-
-
-# Page configuration
+# Page configuration - MUST be first Streamlit command
 st.set_page_config(
     page_title="Shipment Cost Analytics Dashboard",
     page_icon="📊",
@@ -85,16 +54,29 @@ st.markdown("""
 st.markdown("# 📊 Shipment Cost Analytics Dashboard")
 st.markdown("**Executive Overview - Facts & Figures**")
 
-# Load data function
-@st.cache_data
-def load_data(file):
-    df = pd.read_excel(file)
+# Define controllable QC codes
+CONTROLLABLE_QC_CODES = [
+    262, 287, 183, 197, 199, 308, 309, 319, 326, 278, 203
+]
+
+# Optimized data loading function with caching
+@st.cache_data(show_spinner=False)
+def load_and_process_data(file_bytes):
+    """Load and process Excel data with all transformations"""
+    # Read Excel file
+    df = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
+    
+    # Drop duplicate column names
+    df = df.loc[:, ~df.columns.duplicated()]
+    
     # Filter only 440-BILLED status
     df = df[df['STATUS'] == '440-BILLED'].copy()
     
     # Convert date columns
-    date_columns = ['ORD CREATE', 'READY', 'QT PU', 'QDT', 'UPD DEL', 'POD DATE/TIME', 
-                   'Depart Date / Time', 'Arrive Date / Time']
+    date_columns = ['ORD CREATE', 'READY', 'QT PU', 'ACT PU', 'QDT', 'UPD DEL', 
+                   'POD DATE/TIME', 'Depart Date / Time', 'Arrive Date / Time', 
+                   'PICKUP DATE/TIME', 'Depart Date']
+    
     for col in date_columns:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors='coerce')
@@ -103,49 +85,39 @@ def load_data(file):
     USD_TO_EUR = 0.92
     df['TOTAL_CHARGES_EUR'] = pd.to_numeric(df['TOTAL CHARGES'], errors='coerce') * USD_TO_EUR
     
+    # Create route column
+    if {'DEP', 'ARR'}.issubset(df.columns):
+        df['Route'] = df['DEP'].astype(str) + ' → ' + df['ARR'].astype(str)
+    
     return df
 
-# Define controllable QC codes
-CONTROLLABLE_QC_CODES = [
-    262,  # MNX-Incorrect QDT
-    287,  # MNX-Order Entry error
-    183,  # Del Agt-Late del
-    197,  # Del Agt-Late del-Out of hours
-    199,  # Del Agt-Missing documents
-    308,  # Customs delay
-    309,  # Customs delay-FDA Hold
-    319,  # Customs-Late PWK-Customer
-    326,  # W/House-Data entry errors
-    278,  # MNX-Late dispatch-Delivery
-    203   # PU Agt -Late pick up
-]
+@st.cache_data(show_spinner=False)
+def calculate_otp_metrics(df, controllable_codes):
+    """Calculate OTP metrics with caching"""
+    df_otp = df.dropna(subset=['QDT', 'POD DATE/TIME']).copy()
+    
+    if len(df_otp) == 0:
+        return 0, 0, pd.DataFrame()
+    
+    df_otp['ON_TIME_GROSS'] = df_otp['POD DATE/TIME'] <= df_otp['QDT']
+    df_otp['LATE'] = ~df_otp['ON_TIME_GROSS']
+    df_otp['CONTROLLABLE_DELAY'] = df_otp['QCCODE'].isin(controllable_codes)
+    df_otp['ON_TIME_NET'] = df_otp['ON_TIME_GROSS'] | (df_otp['LATE'] & ~df_otp['CONTROLLABLE_DELAY'])
+    
+    gross_otp = (df_otp['ON_TIME_GROSS'].sum() / len(df_otp) * 100)
+    net_otp = (df_otp['ON_TIME_NET'].sum() / len(df_otp) * 100)
+    
+    return gross_otp, net_otp, df_otp
 
 # File uploader
 uploaded_file = st.file_uploader("Upload Excel File", type=['xlsx', 'xls'], label_visibility="collapsed")
 
 if uploaded_file is not None:
-    # Load data
-    df = load_data(uploaded_file)
-    
-    # Calculate OTP metrics
-    def calculate_otp(df):
-        df_otp = df.dropna(subset=['QDT', 'POD DATE/TIME']).copy()
-        df_otp['ON_TIME_GROSS'] = df_otp['POD DATE/TIME'] <= df_otp['QDT']
-        
-        # For NET OTP, exclude shipments that were late due to controllable reasons
-        # NET OTP = (On-time shipments + Late shipments with non-controllable reasons) / Total shipments
-        df_otp['LATE'] = ~df_otp['ON_TIME_GROSS']
-        df_otp['CONTROLLABLE_DELAY'] = df_otp['QCCODE'].isin(CONTROLLABLE_QC_CODES)
-        
-        # Count shipments for NET OTP: on-time OR (late but NOT due to controllable reasons)
-        df_otp['ON_TIME_NET'] = df_otp['ON_TIME_GROSS'] | (df_otp['LATE'] & ~df_otp['CONTROLLABLE_DELAY'])
-        
-        gross_otp = (df_otp['ON_TIME_GROSS'].sum() / len(df_otp) * 100) if len(df_otp) > 0 else 0
-        net_otp = (df_otp['ON_TIME_NET'].sum() / len(df_otp) * 100) if len(df_otp) > 0 else 0
-        
-        return gross_otp, net_otp, df_otp
-    
-    gross_otp, net_otp, df_otp = calculate_otp(df)
+    # Load data with spinner
+    with st.spinner('Loading and processing data...'):
+        file_bytes = uploaded_file.getvalue()
+        df = load_and_process_data(file_bytes)
+        gross_otp, net_otp, df_otp = calculate_otp_metrics(df, CONTROLLABLE_QC_CODES)
     
     # Key Metrics Row
     st.markdown("---")
@@ -182,12 +154,13 @@ if uploaded_file is not None:
         svc_counts = df['SVC'].value_counts().reset_index()
         svc_counts.columns = ['Service', 'Count']
         
-        # Add description mapping
-        svc_desc_map = df.groupby('SVC')['SVCDESC'].first().to_dict()
-        svc_counts['Description'] = svc_counts['Service'].map(svc_desc_map)
-        svc_counts['Percentage'] = (svc_counts['Count'] / svc_counts['Count'].sum() * 100).round(1)
+        if 'SVCDESC' in df.columns:
+            svc_desc_map = df.groupby('SVC')['SVCDESC'].first().to_dict()
+            svc_counts['Description'] = svc_counts['Service'].map(svc_desc_map)
+        else:
+            svc_counts['Description'] = svc_counts['Service']
         
-        # Sort in ascending order for horizontal bar chart (will appear descending visually)
+        svc_counts['Percentage'] = (svc_counts['Count'] / svc_counts['Count'].sum() * 100).round(1)
         svc_counts_sorted = svc_counts.head(10).sort_values('Count', ascending=True)
         
         fig_svc = px.bar(svc_counts_sorted, 
@@ -252,32 +225,33 @@ if uploaded_file is not None:
     
     with col1:
         st.markdown("### Top Departure (DEP) Airports")
-        dep_counts = df['DEP'].value_counts().head(15).reset_index()
-        dep_counts.columns = ['Airport', 'Shipments']
-        
-        # Calculate cost per airport
-        dep_cost = df.groupby('DEP')['TOTAL_CHARGES_EUR'].agg(['sum', 'mean']).reset_index()
-        dep_cost.columns = ['Airport', 'Total_Cost', 'Avg_Cost']
-        dep_counts = dep_counts.merge(dep_cost, on='Airport', how='left')
-        
-        fig_dep = px.treemap(dep_counts, 
-                            path=['Airport'], 
-                            values='Shipments',
-                            color='Avg_Cost',
-                            hover_data={'Shipments': True, 'Total_Cost': ':.0f', 'Avg_Cost': ':.2f'},
-                            color_continuous_scale='RdYlGn_r',
-                            labels={'Avg_Cost': 'Avg Cost (€)', 'DEP': 'Departure'})
-        
-        fig_dep.update_layout(
-            height=400,
-            margin=dict(l=0, r=0, t=0, b=0)
-        )
-        st.plotly_chart(fig_dep, use_container_width=True)
+        if 'DEP' in df.columns:
+            dep_counts = df['DEP'].value_counts().head(15).reset_index()
+            dep_counts.columns = ['Airport', 'Shipments']
+            
+            dep_cost = df.groupby('DEP')['TOTAL_CHARGES_EUR'].agg(['sum', 'mean']).reset_index()
+            dep_cost.columns = ['Airport', 'Total_Cost', 'Avg_Cost']
+            dep_counts = dep_counts.merge(dep_cost, on='Airport', how='left')
+            
+            fig_dep = px.treemap(dep_counts, 
+                                path=['Airport'], 
+                                values='Shipments',
+                                color='Avg_Cost',
+                                hover_data={'Shipments': True, 'Total_Cost': ':.0f', 'Avg_Cost': ':.2f'},
+                                color_continuous_scale='RdYlGn_r',
+                                labels={'Avg_Cost': 'Avg Cost (€)', 'DEP': 'Departure'})
+            
+            fig_dep.update_layout(
+                height=400,
+                margin=dict(l=0, r=0, t=0, b=0)
+            )
+            st.plotly_chart(fig_dep, use_container_width=True)
+        else:
+            st.info("No departure airport data available")
     
     with col2:
         st.markdown("### Cost Distribution Analysis")
         
-        # Create cost bins
         df['Cost_Bin'] = pd.cut(df['TOTAL_CHARGES_EUR'], 
                                 bins=[0, 500, 1000, 2000, 5000, float('inf')],
                                 labels=['<€500', '€500-1K', '€1K-2K', '€2K-5K', '>€5K'])
@@ -306,80 +280,86 @@ if uploaded_file is not None:
     
     with col1:
         st.markdown("### Monthly Trend Analysis")
-        df['Month'] = pd.to_datetime(df['ORD CREATE']).dt.to_period('M')
-        monthly_stats = df.groupby('Month').agg({
-            'REFER': 'count',
-            'TOTAL_CHARGES_EUR': 'sum'
-        }).reset_index()
-        monthly_stats.columns = ['Month', 'Shipments', 'Total_Cost']
-        monthly_stats['Month'] = monthly_stats['Month'].astype(str)
-        
-        # Create subplot with secondary y-axis
-        fig_trend = make_subplots(specs=[[{"secondary_y": True}]])
-        
-        fig_trend.add_trace(
-            go.Bar(x=monthly_stats['Month'], 
-                  y=monthly_stats['Shipments'],
-                  name='Shipments',
-                  marker_color='#3b82f6',
-                  yaxis='y'),
-            secondary_y=False
-        )
-        
-        fig_trend.add_trace(
-            go.Scatter(x=monthly_stats['Month'], 
-                      y=monthly_stats['Total_Cost'],
-                      name='Total Cost (€)',
-                      mode='lines+markers',
-                      marker_color='#ef4444',
-                      line=dict(width=3),
-                      yaxis='y2'),
-            secondary_y=True
-        )
-        
-        fig_trend.update_xaxes(title_text="Month")
-        fig_trend.update_yaxes(title_text="Number of Shipments", secondary_y=False)
-        fig_trend.update_yaxes(title_text="Total Cost (€)", secondary_y=True)
-        fig_trend.update_layout(
-            height=400,
-            margin=dict(l=0, r=0, t=20, b=0),
-            hovermode='x unified',
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-        )
-        st.plotly_chart(fig_trend, use_container_width=True)
+        if 'ORD CREATE' in df.columns:
+            df['Month'] = pd.to_datetime(df['ORD CREATE']).dt.to_period('M')
+            monthly_stats = df.groupby('Month').agg({
+                'REFER': 'count',
+                'TOTAL_CHARGES_EUR': 'sum'
+            }).reset_index()
+            monthly_stats.columns = ['Month', 'Shipments', 'Total_Cost']
+            monthly_stats['Month'] = monthly_stats['Month'].astype(str)
+            
+            fig_trend = make_subplots(specs=[[{"secondary_y": True}]])
+            
+            fig_trend.add_trace(
+                go.Bar(x=monthly_stats['Month'], 
+                      y=monthly_stats['Shipments'],
+                      name='Shipments',
+                      marker_color='#3b82f6',
+                      yaxis='y'),
+                secondary_y=False
+            )
+            
+            fig_trend.add_trace(
+                go.Scatter(x=monthly_stats['Month'], 
+                          y=monthly_stats['Total_Cost'],
+                          name='Total Cost (€)',
+                          mode='lines+markers',
+                          marker_color='#ef4444',
+                          line=dict(width=3),
+                          yaxis='y2'),
+                secondary_y=True
+            )
+            
+            fig_trend.update_xaxes(title_text="Month")
+            fig_trend.update_yaxes(title_text="Number of Shipments", secondary_y=False)
+            fig_trend.update_yaxes(title_text="Total Cost (€)", secondary_y=True)
+            fig_trend.update_layout(
+                height=400,
+                margin=dict(l=0, r=0, t=20, b=0),
+                hovermode='x unified',
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            st.plotly_chart(fig_trend, use_container_width=True)
+        else:
+            st.info("No order creation date data available")
     
     with col2:
         st.markdown("### Quality Control Issues Analysis")
         st.markdown("🟢 **Controllable** (Internal) | 🔴 **Non-Controllable** (External)")
-        qc_data = df[df['QCCODE'].notna()].copy()
         
-        if len(qc_data) > 0:
-            qc_counts = qc_data.groupby(['QCCODE', 'QC NAME']).size().reset_index(name='Count')
-            qc_counts['Issue Type'] = qc_counts['QCCODE'].apply(
-                lambda x: 'Controllable' if x in CONTROLLABLE_QC_CODES else 'Non-Controllable'
-            )
-            qc_counts = qc_counts.sort_values('Count', ascending=False).head(10)
+        if 'QCCODE' in df.columns and 'QC NAME' in df.columns:
+            qc_data = df[df['QCCODE'].notna()].copy()
             
-            fig_qc = px.bar(qc_counts, 
-                           x='Count', 
-                           y='QC NAME',
-                           orientation='h',
-                           color='Issue Type',
-                           color_discrete_map={'Controllable': '#10b981', 'Non-Controllable': '#ef4444'},
-                           text='Count')
-            
-            fig_qc.update_traces(texttemplate='%{text}', textposition='outside')
-            fig_qc.update_layout(
-                height=400,
-                xaxis_title="Number of Occurrences",
-                yaxis_title="",
-                margin=dict(l=0, r=0, t=20, b=0),
-                legend_title="Issue Type",
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-            )
-            st.plotly_chart(fig_qc, use_container_width=True)
+            if len(qc_data) > 0:
+                qc_counts = qc_data.groupby(['QCCODE', 'QC NAME']).size().reset_index(name='Count')
+                qc_counts['Issue Type'] = qc_counts['QCCODE'].apply(
+                    lambda x: 'Controllable' if x in CONTROLLABLE_QC_CODES else 'Non-Controllable'
+                )
+                qc_counts = qc_counts.sort_values('Count', ascending=False).head(10)
+                
+                fig_qc = px.bar(qc_counts, 
+                               x='Count', 
+                               y='QC NAME',
+                               orientation='h',
+                               color='Issue Type',
+                               color_discrete_map={'Controllable': '#10b981', 'Non-Controllable': '#ef4444'},
+                               text='Count')
+                
+                fig_qc.update_traces(texttemplate='%{text}', textposition='outside')
+                fig_qc.update_layout(
+                    height=400,
+                    xaxis_title="Number of Occurrences",
+                    yaxis_title="",
+                    margin=dict(l=0, r=0, t=20, b=0),
+                    legend_title="Issue Type",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+                )
+                st.plotly_chart(fig_qc, use_container_width=True)
+            else:
+                st.info("No quality control issues found in the data")
         else:
-            st.info("No quality control issues found in the data")
+            st.info("Quality control data not available")
     
     # Row 4: Weight Analysis and Route Performance
     st.markdown("---")
@@ -388,59 +368,66 @@ if uploaded_file is not None:
     with col1:
         st.markdown("### Weight Distribution & Cost Correlation")
         
-        # Filter valid weight data
-        weight_data = df[df['Billable Weight KG'].notna() & (df['Billable Weight KG'] > 0)].copy()
-        
-        if len(weight_data) > 0:
-            fig_weight = px.scatter(weight_data.sample(min(500, len(weight_data))), 
-                                  x='Billable Weight KG', 
-                                  y='TOTAL_CHARGES_EUR',
-                                  color='SVC',
-                                  size='PIECES',
-                                  hover_data=['REFER', 'DEP', 'ARR'],
-                                  labels={'TOTAL_CHARGES_EUR': 'Cost (€)', 
-                                         'Billable Weight KG': 'Weight (KG)'},
-                                  opacity=0.6)
+        if 'Billable Weight KG' in df.columns and 'PIECES' in df.columns:
+            weight_data = df[df['Billable Weight KG'].notna() & (df['Billable Weight KG'] > 0)].copy()
             
-            fig_weight.update_layout(
-                height=400,
-                margin=dict(l=0, r=0, t=20, b=0),
-                legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.02)
-            )
-            st.plotly_chart(fig_weight, use_container_width=True)
+            if len(weight_data) > 0:
+                sample_size = min(500, len(weight_data))
+                fig_weight = px.scatter(weight_data.sample(sample_size), 
+                                      x='Billable Weight KG', 
+                                      y='TOTAL_CHARGES_EUR',
+                                      color='SVC',
+                                      size='PIECES',
+                                      hover_data=['REFER', 'DEP', 'ARR'] if all(col in df.columns for col in ['REFER', 'DEP', 'ARR']) else [],
+                                      labels={'TOTAL_CHARGES_EUR': 'Cost (€)', 
+                                             'Billable Weight KG': 'Weight (KG)'},
+                                      opacity=0.6)
+                
+                fig_weight.update_layout(
+                    height=400,
+                    margin=dict(l=0, r=0, t=20, b=0),
+                    legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.02)
+                )
+                st.plotly_chart(fig_weight, use_container_width=True)
+            else:
+                st.info("No weight data available for analysis")
         else:
-            st.info("No weight data available for analysis")
+            st.info("Weight data columns not available")
     
     with col2:
         st.markdown("### Top Routes Performance")
         
-        # Create route column
-        df['Route'] = df['DEP'].astype(str) + ' → ' + df['ARR'].astype(str)
-        route_stats = df.groupby('Route').agg({
-            'REFER': 'count',
-            'TOTAL_CHARGES_EUR': 'mean'
-        }).reset_index()
-        route_stats.columns = ['Route', 'Shipments', 'Avg_Cost']
-        route_stats = route_stats[route_stats['Shipments'] >= 5]  # Filter routes with at least 5 shipments
-        route_stats = route_stats.sort_values('Shipments', ascending=False).head(15)
-        
-        fig_route = px.scatter(route_stats, 
-                             x='Shipments', 
-                             y='Avg_Cost',
-                             size='Shipments',
-                             color='Avg_Cost',
-                             text='Route',
-                             color_continuous_scale='RdYlGn_r',
-                             labels={'Avg_Cost': 'Avg Cost (€)', 'Shipments': 'Number of Shipments'})
-        
-        fig_route.update_traces(textposition='top center', textfont_size=8)
-        fig_route.update_layout(
-            height=400,
-            margin=dict(l=0, r=0, t=20, b=0),
-            showlegend=False,
-            coloraxis_colorbar=dict(title="Avg Cost (€)")
-        )
-        st.plotly_chart(fig_route, use_container_width=True)
+        if 'Route' in df.columns:
+            route_stats = df.groupby('Route').agg({
+                'REFER': 'count',
+                'TOTAL_CHARGES_EUR': 'mean'
+            }).reset_index()
+            route_stats.columns = ['Route', 'Shipments', 'Avg_Cost']
+            route_stats = route_stats[route_stats['Shipments'] >= 5]
+            route_stats = route_stats.sort_values('Shipments', ascending=False).head(15)
+            
+            if len(route_stats) > 0:
+                fig_route = px.scatter(route_stats, 
+                                     x='Shipments', 
+                                     y='Avg_Cost',
+                                     size='Shipments',
+                                     color='Avg_Cost',
+                                     text='Route',
+                                     color_continuous_scale='RdYlGn_r',
+                                     labels={'Avg_Cost': 'Avg Cost (€)', 'Shipments': 'Number of Shipments'})
+                
+                fig_route.update_traces(textposition='top center', textfont_size=8)
+                fig_route.update_layout(
+                    height=400,
+                    margin=dict(l=0, r=0, t=20, b=0),
+                    showlegend=False,
+                    coloraxis_colorbar=dict(title="Avg Cost (€)")
+                )
+                st.plotly_chart(fig_route, use_container_width=True)
+            else:
+                st.info("Not enough route data for analysis")
+        else:
+            st.info("Route data not available")
     
     # Executive Summary
     st.markdown("---")
@@ -449,6 +436,9 @@ if uploaded_file is not None:
     col1, col2 = st.columns(2)
     
     with col1:
+        dep_top = df['DEP'].value_counts().index[0] if 'DEP' in df.columns and len(df['DEP'].value_counts()) > 0 else 'N/A'
+        dep_pct = (df['DEP'].value_counts().iloc[0] / len(df) * 100) if 'DEP' in df.columns and len(df['DEP'].value_counts()) > 0 else 0
+        
         st.markdown("""
         **Key Performance Indicators:**
         - Total shipment volume: **{:,} shipments**
@@ -459,8 +449,8 @@ if uploaded_file is not None:
             len(df),
             df['TOTAL_CHARGES_EUR'].sum(),
             df['TOTAL_CHARGES_EUR'].mean(),
-            df['DEP'].value_counts().index[0] if len(df['DEP'].value_counts()) > 0 else 'N/A',
-            (df['DEP'].value_counts().iloc[0] / len(df) * 100) if len(df['DEP'].value_counts()) > 0 else 0
+            dep_top,
+            dep_pct
         ))
     
     with col2:
@@ -479,19 +469,23 @@ if uploaded_file is not None:
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        completeness = (1 - df['TOTAL CHARGES'].isna().sum() / len(df)) * 100
+        completeness = (1 - df['TOTAL CHARGES'].isna().sum() / len(df)) * 100 if 'TOTAL CHARGES' in df.columns else 0
         st.metric("Cost Data Completeness", f"{completeness:.1f}%")
     
     with col2:
-        date_completeness = (1 - df['POD DATE/TIME'].isna().sum() / len(df)) * 100
+        date_completeness = (1 - df['POD DATE/TIME'].isna().sum() / len(df)) * 100 if 'POD DATE/TIME' in df.columns else 0
         st.metric("Delivery Data Completeness", f"{date_completeness:.1f}%")
     
     with col3:
-        qc_coverage = (df['QCCODE'].notna().sum() / len(df[df['POD DATE/TIME'] > df['QDT']])) * 100 if len(df[df['POD DATE/TIME'] > df['QDT']]) > 0 else 100
+        if 'QCCODE' in df.columns and 'POD DATE/TIME' in df.columns and 'QDT' in df.columns:
+            late_shipments = df[df['POD DATE/TIME'] > df['QDT']]
+            qc_coverage = (df['QCCODE'].notna().sum() / len(late_shipments)) * 100 if len(late_shipments) > 0 else 100
+        else:
+            qc_coverage = 0
         st.metric("QC Code Coverage", f"{qc_coverage:.1f}%")
     
     with col4:
-        unique_routes = df['Route'].nunique()
+        unique_routes = df['Route'].nunique() if 'Route' in df.columns else 0
         st.metric("Unique Routes", f"{unique_routes:,}")
 
 else:
