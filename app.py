@@ -56,16 +56,26 @@ def load_data(file_path):
     # Filter for 440-BILLED status
     df_billed = df[df['STATUS'] == '440-BILLED'].copy()
     
-    # Convert date columns
-    date_columns = ['ORD CREATE', 'Depart Date / Time', 'Arrive Date / Time', 'POD DATE/TIME']
+    # Convert date columns - handle both Excel serial dates and datetime strings
+    date_columns = ['ORD CREATE', 'Depart Date / Time', 'Arrive Date / Time', 'POD DATE/TIME', 'QDT', 'READY']
     for col in date_columns:
         if col in df_billed.columns:
-            df_billed[col] = pd.to_datetime(df_billed[col], errors='coerce', unit='D', origin='1899-12-30')
+            # First try to convert as datetime string
+            df_billed[col] = pd.to_datetime(df_billed[col], errors='coerce')
+            
+            # For any remaining numeric values (Excel serial dates), convert them
+            numeric_mask = pd.to_numeric(df_billed[col], errors='coerce').notna()
+            if numeric_mask.any():
+                # Create a temporary series for numeric values
+                temp_numeric = pd.to_numeric(df_billed.loc[numeric_mask, col], errors='coerce')
+                # Convert Excel serial date to datetime
+                df_billed.loc[numeric_mask, col] = pd.to_datetime('1899-12-30') + pd.to_timedelta(temp_numeric, unit='D')
     
     # Clean numeric columns
     df_billed['TOTAL CHARGES'] = pd.to_numeric(df_billed['TOTAL CHARGES'], errors='coerce')
     df_billed['PIECES'] = pd.to_numeric(df_billed['PIECES'], errors='coerce')
     df_billed['Billable Weight KG'] = pd.to_numeric(df_billed['Billable Weight KG'], errors='coerce')
+    df_billed['Time In Transit'] = pd.to_numeric(df_billed['Time In Transit'], errors='coerce')
     
     # Convert to EUR (assuming USD to EUR rate of 0.92)
     USD_TO_EUR = 0.92
@@ -89,14 +99,36 @@ CONTROLLABLE_QC_CODES = {
 
 def calculate_otp(df):
     """Calculate On-Time Performance (OTP) metrics"""
+    # Ensure we have the necessary columns
+    if 'POD DATE/TIME' not in df.columns or 'QDT' not in df.columns:
+        return 0, 0
+    
+    # Create a copy to avoid warnings
+    df_calc = df.copy()
+    
     # Gross OTP: All shipments delivered on time
-    df['On_Time'] = pd.to_datetime(df['POD DATE/TIME']) <= pd.to_datetime(df['QDT'])
-    gross_otp = (df['On_Time'].sum() / len(df)) * 100 if len(df) > 0 else 0
+    # Only calculate for rows where both dates are available
+    valid_dates = df_calc['POD DATE/TIME'].notna() & df_calc['QDT'].notna()
+    if valid_dates.sum() > 0:
+        df_calc.loc[valid_dates, 'On_Time'] = pd.to_datetime(df_calc.loc[valid_dates, 'POD DATE/TIME']) <= pd.to_datetime(df_calc.loc[valid_dates, 'QDT'])
+        gross_otp = (df_calc['On_Time'].sum() / valid_dates.sum()) * 100
+    else:
+        gross_otp = 0
+        df_calc['On_Time'] = False
     
     # Net OTP: Excluding non-controllable delays
-    df['Is_Controllable'] = df['QCCODE'].astype(str).isin(CONTROLLABLE_QC_CODES.keys())
-    df_controllable = df[~df['Is_Controllable'] | df['On_Time']]
-    net_otp = (df_controllable['On_Time'].sum() / len(df_controllable)) * 100 if len(df_controllable) > 0 else 0
+    df_calc['Is_Controllable'] = df_calc['QCCODE'].astype(str).isin(CONTROLLABLE_QC_CODES.keys())
+    
+    # For net OTP, exclude shipments with non-controllable delays
+    df_controllable = df_calc[~df_calc['Is_Controllable'] | df_calc['On_Time']]
+    if len(df_controllable) > 0 and 'On_Time' in df_controllable.columns:
+        net_otp = (df_controllable['On_Time'].sum() / len(df_controllable)) * 100
+    else:
+        net_otp = gross_otp
+    
+    # Add the calculated columns back to the original dataframe
+    df['On_Time'] = df_calc['On_Time'] if 'On_Time' in df_calc.columns else False
+    df['Is_Controllable'] = df_calc['Is_Controllable'] if 'Is_Controllable' in df_calc.columns else False
     
     return gross_otp, net_otp
 
@@ -123,12 +155,20 @@ with st.sidebar:
     
     # Date range filter
     st.subheader("Date Range")
-    date_range = st.date_input(
-        "Select Period",
-        value=(df['ORD CREATE'].min().date() if not df.empty else datetime.now().date(),
-               df['ORD CREATE'].max().date() if not df.empty else datetime.now().date()),
-        format="DD/MM/YYYY"
-    )
+    if not df.empty and 'ORD CREATE' in df.columns:
+        min_date = df['ORD CREATE'].min()
+        max_date = df['ORD CREATE'].max()
+        if pd.notna(min_date) and pd.notna(max_date):
+            date_range = st.date_input(
+                "Select Period",
+                value=(min_date.date() if isinstance(min_date, pd.Timestamp) else datetime.now().date(),
+                       max_date.date() if isinstance(max_date, pd.Timestamp) else datetime.now().date()),
+                format="DD/MM/YYYY"
+            )
+        else:
+            date_range = None
+    else:
+        date_range = None
     
     # Service filter
     st.subheader("Service Type")
@@ -323,50 +363,62 @@ st.plotly_chart(fig_airport, use_container_width=True)
 # Time Series Analysis
 st.markdown("## 📅 Temporal Trends")
 
-# Prepare time series data
-df_filtered['Month'] = pd.to_datetime(df_filtered['ORD CREATE']).dt.to_period('M')
-monthly_data = df_filtered.groupby('Month').agg({
-    'REFER': 'count',
-    'TOTAL CHARGES EUR': 'sum',
-    'On_Time': lambda x: (x.sum() / len(x) * 100) if len(x) > 0 else 0
-}).reset_index()
-monthly_data['Month'] = monthly_data['Month'].astype(str)
-monthly_data.columns = ['Month', 'Shipments', 'Revenue', 'OTP %']
-
-# Create time series chart
-fig_timeline = make_subplots(
-    rows=3, cols=1,
-    subplot_titles=('Monthly Shipment Volume', 'Monthly Revenue (€)', 'Monthly OTP %'),
-    row_heights=[0.33, 0.33, 0.34]
-)
-
-fig_timeline.add_trace(
-    go.Scatter(x=monthly_data['Month'], y=monthly_data['Shipments'],
-               mode='lines+markers', name='Shipments', fill='tozeroy',
-               line=dict(color='blue', width=3)),
-    row=1, col=1
-)
-
-fig_timeline.add_trace(
-    go.Scatter(x=monthly_data['Month'], y=monthly_data['Revenue'],
-               mode='lines+markers', name='Revenue', fill='tozeroy',
-               line=dict(color='green', width=3)),
-    row=2, col=1
-)
-
-fig_timeline.add_trace(
-    go.Scatter(x=monthly_data['Month'], y=monthly_data['OTP %'],
-               mode='lines+markers', name='OTP %',
-               line=dict(color='red', width=3)),
-    row=3, col=1
-)
-
-# Add 95% OTP target line
-fig_timeline.add_hline(y=95, line_dash="dash", line_color="gray", 
-                       annotation_text="Target: 95%", row=3, col=1)
-
-fig_timeline.update_layout(height=900, showlegend=False)
-st.plotly_chart(fig_timeline, use_container_width=True)
+# Prepare time series data - only if we have date data
+if 'ORD CREATE' in df_filtered.columns and df_filtered['ORD CREATE'].notna().any():
+    df_time = df_filtered[df_filtered['ORD CREATE'].notna()].copy()
+    df_time['Month'] = pd.to_datetime(df_time['ORD CREATE']).dt.to_period('M')
+    
+    monthly_data = df_time.groupby('Month').agg({
+        'REFER': 'count',
+        'TOTAL CHARGES EUR': 'sum'
+    }).reset_index()
+    
+    # Calculate OTP only if On_Time column exists
+    if 'On_Time' in df_time.columns:
+        monthly_otp = df_time.groupby('Month')['On_Time'].apply(lambda x: (x.sum() / len(x) * 100) if len(x) > 0 else 0).reset_index()
+        monthly_data = monthly_data.merge(monthly_otp, on='Month', how='left')
+    else:
+        monthly_data['On_Time'] = 0
+    
+    monthly_data['Month'] = monthly_data['Month'].astype(str)
+    monthly_data.columns = ['Month', 'Shipments', 'Revenue', 'OTP %']
+    
+    # Create time series chart
+    fig_timeline = make_subplots(
+        rows=3, cols=1,
+        subplot_titles=('Monthly Shipment Volume', 'Monthly Revenue (€)', 'Monthly OTP %'),
+        row_heights=[0.33, 0.33, 0.34]
+    )
+    
+    fig_timeline.add_trace(
+        go.Scatter(x=monthly_data['Month'], y=monthly_data['Shipments'],
+                   mode='lines+markers', name='Shipments', fill='tozeroy',
+                   line=dict(color='blue', width=3)),
+        row=1, col=1
+    )
+    
+    fig_timeline.add_trace(
+        go.Scatter(x=monthly_data['Month'], y=monthly_data['Revenue'],
+                   mode='lines+markers', name='Revenue', fill='tozeroy',
+                   line=dict(color='green', width=3)),
+        row=2, col=1
+    )
+    
+    fig_timeline.add_trace(
+        go.Scatter(x=monthly_data['Month'], y=monthly_data['OTP %'],
+                   mode='lines+markers', name='OTP %',
+                   line=dict(color='red', width=3)),
+        row=3, col=1
+    )
+    
+    # Add 95% OTP target line
+    fig_timeline.add_hline(y=95, line_dash="dash", line_color="gray", 
+                           annotation_text="Target: 95%", row=3, col=1)
+    
+    fig_timeline.update_layout(height=900, showlegend=False)
+    st.plotly_chart(fig_timeline, use_container_width=True)
+else:
+    st.info("Time series analysis requires valid date data")
 
 # Quality Control Analysis
 st.markdown("## 🔍 Quality Control Analysis")
