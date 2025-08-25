@@ -100,12 +100,13 @@ if uploaded_file is not None:
         df_otp = df.dropna(subset=['QDT', 'POD DATE/TIME']).copy()
         df_otp['ON_TIME_GROSS'] = df_otp['POD DATE/TIME'] <= df_otp['QDT']
         
-        # For NET OTP, consider controllable QC codes
-        df_otp['ON_TIME_NET'] = df_otp.apply(
-            lambda row: True if row['ON_TIME_GROSS'] else 
-            (row['QCCODE'] in CONTROLLABLE_QC_CODES if pd.notna(row['QCCODE']) else False),
-            axis=1
-        )
+        # For NET OTP, exclude shipments that were late due to controllable reasons
+        # NET OTP = (On-time shipments + Late shipments with non-controllable reasons) / Total shipments
+        df_otp['LATE'] = ~df_otp['ON_TIME_GROSS']
+        df_otp['CONTROLLABLE_DELAY'] = df_otp['QCCODE'].isin(CONTROLLABLE_QC_CODES)
+        
+        # Count shipments for NET OTP: on-time OR (late but NOT due to controllable reasons)
+        df_otp['ON_TIME_NET'] = df_otp['ON_TIME_GROSS'] | (df_otp['LATE'] & ~df_otp['CONTROLLABLE_DELAY'])
         
         gross_otp = (df_otp['ON_TIME_GROSS'].sum() / len(df_otp) * 100) if len(df_otp) > 0 else 0
         net_otp = (df_otp['ON_TIME_NET'].sum() / len(df_otp) * 100) if len(df_otp) > 0 else 0
@@ -154,7 +155,10 @@ if uploaded_file is not None:
         svc_counts['Description'] = svc_counts['Service'].map(svc_desc_map)
         svc_counts['Percentage'] = (svc_counts['Count'] / svc_counts['Count'].sum() * 100).round(1)
         
-        fig_svc = px.bar(svc_counts.head(10), 
+        # Sort in ascending order for horizontal bar chart (will appear descending visually)
+        svc_counts_sorted = svc_counts.head(10).sort_values('Count', ascending=True)
+        
+        fig_svc = px.bar(svc_counts_sorted, 
                          x='Count', 
                          y='Service',
                          orientation='h',
@@ -215,7 +219,7 @@ if uploaded_file is not None:
     col1, col2 = st.columns(2)
     
     with col1:
-        st.markdown("### Top Departure Airports")
+        st.markdown("### Top Departure (DEP) Airports")
         dep_counts = df['DEP'].value_counts().head(15).reset_index()
         dep_counts.columns = ['Airport', 'Shipments']
         
@@ -230,7 +234,7 @@ if uploaded_file is not None:
                             color='Avg_Cost',
                             hover_data={'Shipments': True, 'Total_Cost': ':.0f', 'Avg_Cost': ':.2f'},
                             color_continuous_scale='RdYlGn_r',
-                            labels={'Avg_Cost': 'Avg Cost (€)'})
+                            labels={'Avg_Cost': 'Avg Cost (€)', 'DEP': 'Departure'})
         
         fig_dep.update_layout(
             height=400,
@@ -314,20 +318,22 @@ if uploaded_file is not None:
     
     with col2:
         st.markdown("### Quality Control Issues Analysis")
+        st.markdown("🟢 **Controllable** (Internal) | 🔴 **Non-Controllable** (External)")
         qc_data = df[df['QCCODE'].notna()].copy()
         
         if len(qc_data) > 0:
             qc_counts = qc_data.groupby(['QCCODE', 'QC NAME']).size().reset_index(name='Count')
-            qc_counts['Controllable'] = qc_counts['QCCODE'].isin(CONTROLLABLE_QC_CODES)
+            qc_counts['Issue Type'] = qc_counts['QCCODE'].apply(
+                lambda x: 'Controllable' if x in CONTROLLABLE_QC_CODES else 'Non-Controllable'
+            )
             qc_counts = qc_counts.sort_values('Count', ascending=False).head(10)
             
             fig_qc = px.bar(qc_counts, 
                            x='Count', 
                            y='QC NAME',
                            orientation='h',
-                           color='Controllable',
-                           color_discrete_map={True: '#10b981', False: '#ef4444'},
-                           labels={'Controllable': 'Type'},
+                           color='Issue Type',
+                           color_discrete_map={'Controllable': '#10b981', 'Non-Controllable': '#ef4444'},
                            text='Count')
             
             fig_qc.update_traces(texttemplate='%{text}', textposition='outside')
