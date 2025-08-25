@@ -56,26 +56,49 @@ def load_data(file_path):
     # Filter for 440-BILLED status
     df_billed = df[df['STATUS'] == '440-BILLED'].copy()
     
-    # Convert date columns - handle both Excel serial dates and datetime strings
-    date_columns = ['ORD CREATE', 'Depart Date / Time', 'Arrive Date / Time', 'POD DATE/TIME', 'QDT', 'READY']
+    # Convert date columns - handle various date formats
+    date_columns = ['ORD CREATE', 'Depart Date / Time', 'Arrive Date / Time', 'POD DATE/TIME', 'QDT', 'READY', 'UPD DEL', 'PICKUP DATE/TIME']
+    
     for col in date_columns:
         if col in df_billed.columns:
-            # First try to convert as datetime string
-            df_billed[col] = pd.to_datetime(df_billed[col], errors='coerce')
+            # Create a temporary column to store converted dates
+            temp_dates = pd.Series(index=df_billed.index, dtype='datetime64[ns]')
             
-            # For any remaining numeric values (Excel serial dates), convert them
-            numeric_mask = pd.to_numeric(df_billed[col], errors='coerce').notna()
-            if numeric_mask.any():
-                # Create a temporary series for numeric values
-                temp_numeric = pd.to_numeric(df_billed.loc[numeric_mask, col], errors='coerce')
-                # Convert Excel serial date to datetime
-                df_billed.loc[numeric_mask, col] = pd.to_datetime('1899-12-30') + pd.to_timedelta(temp_numeric, unit='D')
+            for idx, value in df_billed[col].items():
+                if pd.isna(value) or value == '':
+                    continue
+                    
+                try:
+                    # Try different conversion methods
+                    if isinstance(value, (int, float)):
+                        # Excel serial date
+                        if value > 0 and value < 100000:  # Reasonable range for Excel dates
+                            temp_dates[idx] = pd.Timestamp('1899-12-30') + pd.Timedelta(days=value)
+                    elif isinstance(value, str):
+                        # Try various date formats
+                        for fmt in ['%Y-%m-%d %H:%M', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%m-%d-%Y', '%m/%d/%Y', '%d/%m/%Y']:
+                            try:
+                                temp_dates[idx] = pd.to_datetime(value, format=fmt)
+                                break
+                            except:
+                                continue
+                        # If no format worked, try pandas auto-detection
+                        if pd.isna(temp_dates[idx]):
+                            temp_dates[idx] = pd.to_datetime(value, errors='coerce')
+                    else:
+                        # Already a datetime
+                        temp_dates[idx] = pd.to_datetime(value, errors='coerce')
+                except:
+                    # If all else fails, leave as NaT
+                    continue
+            
+            df_billed[col] = temp_dates
     
     # Clean numeric columns
-    df_billed['TOTAL CHARGES'] = pd.to_numeric(df_billed['TOTAL CHARGES'], errors='coerce')
-    df_billed['PIECES'] = pd.to_numeric(df_billed['PIECES'], errors='coerce')
-    df_billed['Billable Weight KG'] = pd.to_numeric(df_billed['Billable Weight KG'], errors='coerce')
-    df_billed['Time In Transit'] = pd.to_numeric(df_billed['Time In Transit'], errors='coerce')
+    numeric_columns = ['TOTAL CHARGES', 'PIECES', 'Billable Weight KG', 'Time In Transit', 'WEIGHT(KG)', 'WT LB', 'Billable Weight LB', 'TOT DST']
+    for col in numeric_columns:
+        if col in df_billed.columns:
+            df_billed[col] = pd.to_numeric(df_billed[col], errors='coerce')
     
     # Convert to EUR (assuming USD to EUR rate of 0.92)
     USD_TO_EUR = 0.92
@@ -310,55 +333,73 @@ with col2:
 # Departure Airport Analysis
 st.markdown("## ✈️ Departure Airport Performance")
 
-dep_analysis = df_filtered.groupby('DEP').agg({
-    'REFER': 'count',
-    'TOTAL CHARGES EUR': 'sum',
-    'Time In Transit': 'mean',
-    'On_Time': lambda x: (x.sum() / len(x) * 100) if len(x) > 0 else 0
-}).reset_index()
-dep_analysis.columns = ['Airport', 'Shipments', 'Revenue', 'Avg Transit Days', 'OTP %']
-dep_analysis = dep_analysis.sort_values('Shipments', ascending=False).head(15)
-
-# Create subplots for airport analysis
-fig_airport = make_subplots(
-    rows=2, cols=2,
-    subplot_titles=('Shipment Volume by Airport', 'Revenue by Airport (€)', 
-                    'Average Transit Time by Airport', 'OTP % by Airport'),
-    specs=[[{'type': 'bar'}, {'type': 'bar'}],
-           [{'type': 'bar'}, {'type': 'scatter'}]]
-)
-
-# Shipment volume
-fig_airport.add_trace(
-    go.Bar(x=dep_analysis['Airport'], y=dep_analysis['Shipments'], 
-           name='Shipments', marker_color='lightblue'),
-    row=1, col=1
-)
-
-# Revenue
-fig_airport.add_trace(
-    go.Bar(x=dep_analysis['Airport'], y=dep_analysis['Revenue'], 
-           name='Revenue', marker_color='lightgreen'),
-    row=1, col=2
-)
-
-# Transit time
-fig_airport.add_trace(
-    go.Bar(x=dep_analysis['Airport'], y=dep_analysis['Avg Transit Days'], 
-           name='Transit Days', marker_color='coral'),
-    row=2, col=1
-)
-
-# OTP percentage
-fig_airport.add_trace(
-    go.Scatter(x=dep_analysis['Airport'], y=dep_analysis['OTP %'], 
-               mode='lines+markers', name='OTP %', marker_color='purple'),
-    row=2, col=2
-)
-
-fig_airport.update_layout(height=800, showlegend=False)
-fig_airport.update_xaxes(tickangle=45)
-st.plotly_chart(fig_airport, use_container_width=True)
+if 'DEP' in df_filtered.columns:
+    dep_analysis = df_filtered.groupby('DEP').agg({
+        'REFER': 'count',
+        'TOTAL CHARGES EUR': 'sum'
+    }).reset_index()
+    dep_analysis.columns = ['Airport', 'Shipments', 'Revenue']
+    
+    # Add transit time if available
+    if 'Time In Transit' in df_filtered.columns:
+        transit_by_dep = df_filtered.groupby('DEP')['Time In Transit'].mean().reset_index()
+        transit_by_dep.columns = ['Airport', 'Avg Transit Days']
+        dep_analysis = dep_analysis.merge(transit_by_dep, on='Airport', how='left')
+    else:
+        dep_analysis['Avg Transit Days'] = 0
+    
+    # Add OTP if available
+    if 'On_Time' in df_filtered.columns:
+        otp_by_dep = df_filtered.groupby('DEP')['On_Time'].apply(lambda x: (x.sum() / len(x) * 100) if len(x) > 0 else 0).reset_index()
+        otp_by_dep.columns = ['Airport', 'OTP %']
+        dep_analysis = dep_analysis.merge(otp_by_dep, on='Airport', how='left')
+    else:
+        dep_analysis['OTP %'] = 0
+    
+    dep_analysis = dep_analysis.sort_values('Shipments', ascending=False).head(15)
+    
+    # Create subplots for airport analysis
+    fig_airport = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=('Shipment Volume by Airport', 'Revenue by Airport (€)', 
+                        'Average Transit Time by Airport', 'OTP % by Airport'),
+        specs=[[{'type': 'bar'}, {'type': 'bar'}],
+               [{'type': 'bar'}, {'type': 'scatter'}]]
+    )
+    
+    # Shipment volume
+    fig_airport.add_trace(
+        go.Bar(x=dep_analysis['Airport'], y=dep_analysis['Shipments'], 
+               name='Shipments', marker_color='lightblue'),
+        row=1, col=1
+    )
+    
+    # Revenue
+    fig_airport.add_trace(
+        go.Bar(x=dep_analysis['Airport'], y=dep_analysis['Revenue'], 
+               name='Revenue', marker_color='lightgreen'),
+        row=1, col=2
+    )
+    
+    # Transit time
+    fig_airport.add_trace(
+        go.Bar(x=dep_analysis['Airport'], y=dep_analysis['Avg Transit Days'], 
+               name='Transit Days', marker_color='coral'),
+        row=2, col=1
+    )
+    
+    # OTP percentage
+    fig_airport.add_trace(
+        go.Scatter(x=dep_analysis['Airport'], y=dep_analysis['OTP %'], 
+                   mode='lines+markers', name='OTP %', marker_color='purple'),
+        row=2, col=2
+    )
+    
+    fig_airport.update_layout(height=800, showlegend=False)
+    fig_airport.update_xaxes(tickangle=45)
+    st.plotly_chart(fig_airport, use_container_width=True)
+else:
+    st.info("Departure airport analysis requires DEP column in the data")
 
 # Time Series Analysis
 st.markdown("## 📅 Temporal Trends")
@@ -444,19 +485,27 @@ with col1:
 
 with col2:
     # Controllable vs Non-controllable
-    controllable_count = df_filtered['Is_Controllable'].sum()
-    non_controllable = len(df_filtered[df_filtered['QCCODE'].notna()]) - controllable_count
-    
-    fig_control = go.Figure(data=[
-        go.Bar(name='Controllable', x=['QC Issues'], y=[controllable_count], marker_color='orange'),
-        go.Bar(name='Non-Controllable', x=['QC Issues'], y=[non_controllable], marker_color='gray')
-    ])
-    fig_control.update_layout(
-        title='Controllable vs Non-Controllable Issues',
-        barmode='stack',
-        height=400
-    )
-    st.plotly_chart(fig_control, use_container_width=True)
+    if 'QCCODE' in df_filtered.columns:
+        qc_with_codes = df_filtered[df_filtered['QCCODE'].notna()]
+        if 'Is_Controllable' in qc_with_codes.columns:
+            controllable_count = qc_with_codes['Is_Controllable'].sum()
+            non_controllable = len(qc_with_codes) - controllable_count
+        else:
+            controllable_count = len(qc_with_codes[qc_with_codes['QCCODE'].astype(str).isin(CONTROLLABLE_QC_CODES.keys())])
+            non_controllable = len(qc_with_codes) - controllable_count
+        
+        fig_control = go.Figure(data=[
+            go.Bar(name='Controllable', x=['QC Issues'], y=[controllable_count], marker_color='orange'),
+            go.Bar(name='Non-Controllable', x=['QC Issues'], y=[non_controllable], marker_color='gray')
+        ])
+        fig_control.update_layout(
+            title='Controllable vs Non-Controllable Issues',
+            barmode='stack',
+            height=400
+        )
+        st.plotly_chart(fig_control, use_container_width=True)
+    else:
+        st.info("Quality control analysis requires QC data")
 
 # Cost Analysis
 st.markdown("## 💰 Financial Performance")
@@ -511,16 +560,21 @@ with st.container():
         
     with col2:
         # Top performing routes
-        top_routes = df_filtered.groupby('DEP')['On_Time'].mean().sort_values(ascending=False).head(3)
-        st.markdown("**Top Performing Routes:**")
-        for route, otp in top_routes.items():
-            st.markdown(f"- {route}: {otp*100:.1f}% OTP")
-        
-        # Bottom performing routes
-        bottom_routes = df_filtered.groupby('DEP')['On_Time'].mean().sort_values(ascending=True).head(3)
-        st.markdown("**Routes Needing Attention:**")
-        for route, otp in bottom_routes.items():
-            st.markdown(f"- {route}: {otp*100:.1f}% OTP ⚠️")
+        if 'On_Time' in df_filtered.columns:
+            top_routes = df_filtered.groupby('DEP')['On_Time'].mean().sort_values(ascending=False).head(3)
+            if not top_routes.empty:
+                st.markdown("**Top Performing Routes:**")
+                for route, otp in top_routes.items():
+                    st.markdown(f"- {route}: {otp*100:.1f}% OTP")
+            
+            # Bottom performing routes
+            bottom_routes = df_filtered.groupby('DEP')['On_Time'].mean().sort_values(ascending=True).head(3)
+            if not bottom_routes.empty:
+                st.markdown("**Routes Needing Attention:**")
+                for route, otp in bottom_routes.items():
+                    st.markdown(f"- {route}: {otp*100:.1f}% OTP ⚠️")
+        else:
+            st.info("OTP analysis requires delivery date information")
 
     st.markdown("""
     ### 🎯 Strategic Recommendations:
